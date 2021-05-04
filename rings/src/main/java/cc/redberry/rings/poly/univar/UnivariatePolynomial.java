@@ -593,6 +593,7 @@ public final class UnivariatePolynomial<E> implements IUnivariatePolynomial<Univ
     }
 
     /**
+     *
      */
     public E normMax() {
         return maxAbsCoefficient();
@@ -1359,25 +1360,33 @@ public final class UnivariatePolynomial<E> implements IUnivariatePolynomial<Univ
 
     /* =========================== Exact multiplication with safe arithmetics =========================== */
 
-
     /** switch to classical multiplication */
     static final long KARATSUBA_THRESHOLD = 1024L;
-    /** when use Karatsuba fast multiplication */
+    /** when use Classical/Karatsuba/Schoenhage-Strassen fast multiplication */
     static final long
             MUL_CLASSICAL_THRESHOLD = 256L * 256L,
+            MUL_KRONECKER_THRESHOLD = 32L * 32L,
             MUL_MOD_CLASSICAL_THRESHOLD = 128L * 128L;
 
     /** switch algorithms */
+    @SuppressWarnings({"unchecked", "rawtypes"})
     final E[] multiplySafe0(UnivariatePolynomial<E> oth) {
-        if (1L * (degree + 1) * (degree + 1) <= MUL_CLASSICAL_THRESHOLD)
+        long md = 1L * (degree + 1) * (oth.degree + 1);
+        if (isOverZ() && md >= MUL_KRONECKER_THRESHOLD)
+            return (E[]) multiplyKronecker0((UnivariatePolynomial) this, (UnivariatePolynomial) oth);
+        if (md <= MUL_CLASSICAL_THRESHOLD)
             return multiplyClassicalSafe(data, 0, degree + 1, oth.data, 0, oth.degree + 1);
         else
             return multiplyKaratsubaSafe(data, 0, degree + 1, oth.data, 0, oth.degree + 1);
     }
 
     /** switch algorithms */
+    @SuppressWarnings({"unchecked", "rawtypes"})
     final E[] squareSafe0() {
-        if (1L * (degree + 1) * (degree + 1) <= MUL_CLASSICAL_THRESHOLD)
+        long md = 1L * (degree + 1) * (degree + 1);
+        if (isOverZ() && md >= MUL_KRONECKER_THRESHOLD)
+            return (E[]) squareKronecker0((UnivariatePolynomial) this);
+        if (md <= MUL_CLASSICAL_THRESHOLD)
             return squareClassicalSafe(data, 0, degree + 1);
         else
             return squareKaratsubaSafe(data, 0, degree + 1);
@@ -1634,5 +1643,200 @@ public final class UnivariatePolynomial<E> implements IUnivariatePolynomial<Univ
             result[i + 2 * split] = ring.addMutable(result[i + 2 * split], f1g1[i]);
 
         return result;
+    }
+
+    /* ====================== Schönhage–Strassen algorithm algorithm via Kronecker substitution ====================== */
+
+    /**
+     * Kronecker substitution adapted from https://github.com/tbuktu/ntru/blob/master/src/main/java/net/sf/ntru/polynomial/BigIntPolynomial.java
+     */
+    static UnivariatePolynomial<BigInteger> squareKronecker(UnivariatePolynomial<BigInteger> poly) {
+        return create(Rings.Z, squareKronecker0(poly));
+    }
+
+    /**
+     * Kronecker substitution adapted from https://github.com/tbuktu/ntru/blob/master/src/main/java/net/sf/ntru/polynomial/BigIntPolynomial.java
+     */
+    private static BigInteger[] squareKronecker0(UnivariatePolynomial<BigInteger> poly) {
+        int len = poly.degree + 1;
+
+        // determine #bits needed per coefficient
+        int logMinDigits = 32 - Integer.numberOfLeadingZeros(len - 1);
+        int maxLength = 0;
+        for (BigInteger cf : poly)
+            maxLength = Math.max(maxLength, cf.bitLength());
+
+        int k = logMinDigits + 2 * maxLength + 1;   // in bits
+        k = (k + 31) / 32;   // in ints
+
+        // encode each polynomial into an int[]
+        int[] pInt = toIntArray(poly, k);
+        int[] cInt = toIntArray(toBigInteger(pInt).pow(2));
+
+        // decode poly coefficients from the product
+        BigInteger[] cPoly = new BigInteger[2 * len - 1];
+        decodePoly(k, cInt, cPoly);
+        return cPoly;
+    }
+
+    private static void decodePoly(int k, int[] cInt, BigInteger[] cPoly) {
+        BigInteger _2k = BigInteger.ONE.shiftLeft(k * 32);
+        Arrays.fill(cPoly, BigInteger.ZERO);
+        for (int i = 0; i < cPoly.length; i++) {
+            int[] cfInt = Arrays.copyOfRange(cInt, i * k, (i + 1) * k);
+            BigInteger cf = toBigInteger(cfInt);
+            if (cfInt[k - 1] < 0) {   // if coeff > 2^(k-1)
+                cf = cf.subtract(_2k);
+
+                // add 2^k to cInt which is the same as subtracting coeff
+                boolean carry;
+                int cIdx = (i + 1) * k;
+                do {
+                    cInt[cIdx]++;
+                    carry = cInt[cIdx] == 0;
+                    cIdx++;
+                } while (carry);
+            }
+            cPoly[i] = cPoly[i].add(cf);
+        }
+    }
+
+    /**
+     * Kronecker substitution adapted from https://github.com/tbuktu/ntru/blob/master/src/main/java/net/sf/ntru/polynomial/BigIntPolynomial.java
+     */
+    static UnivariatePolynomial<BigInteger>
+    multiplyKronecker(UnivariatePolynomial<BigInteger> poly1,
+                      UnivariatePolynomial<BigInteger> poly2) {
+        return create(Rings.Z, multiplyKronecker0(poly1, poly2));
+    }
+
+    /**
+     * Kronecker substitution adapted from https://github.com/tbuktu/ntru/blob/master/src/main/java/net/sf/ntru/polynomial/BigIntPolynomial.java
+     */
+    static BigInteger[]
+    multiplyKronecker0(UnivariatePolynomial<BigInteger> poly1,
+                       UnivariatePolynomial<BigInteger> poly2) {
+        if (poly2.degree > poly1.degree)
+            return multiplyKronecker0(poly2, poly1);
+        int len1 = poly1.degree + 1;
+        int len2 = poly2.degree + 1;
+
+        // determine #bits needed per coefficient
+        int logMinDigits = 32 - Integer.numberOfLeadingZeros(len1 - 1);
+        int maxLengthA = 0;
+        for (BigInteger cf : poly1)
+            maxLengthA = Math.max(maxLengthA, cf.bitLength());
+        int maxLengthB = 0;
+        for (BigInteger cf : poly2)
+            maxLengthB = Math.max(maxLengthB, cf.bitLength());
+
+        int k = logMinDigits + maxLengthA + maxLengthB + 1;   // in bits
+        k = (k + 31) / 32;   // in ints
+
+        // encode each polynomial into an int[]
+        int[] aInt = toIntArray(poly1, k);
+        int[] bInt = toIntArray(poly2, k);
+        // multiply
+        int[] cInt = toIntArray(toBigInteger(aInt).multiply(toBigInteger(bInt)));
+
+        // decode poly coefficients from the product
+        BigInteger[] cPoly = new BigInteger[len1 + len2 - 1];
+        decodePoly(k, cInt, cPoly);
+
+        int aSign = poly1.lc().signum();
+        int bSign = poly2.lc().signum();
+        if (aSign * bSign < 0)
+            for (int i = 0; i < cPoly.length; i++)
+                cPoly[i] = cPoly[i].negate();
+
+        return cPoly;
+    }
+
+    /**
+     * Converts a <code>int</code> array to a {@link BigInteger}.
+     *
+     * @return the <code>BigInteger</code> representation of the array
+     */
+    private static BigInteger toBigInteger(int[] a) {
+        byte[] b = new byte[a.length * 4];
+        for (int i = 0; i < a.length; i++) {
+            int iRev = a.length - 1 - i;
+            b[i * 4] = (byte) (a[iRev] >>> 24);
+            b[i * 4 + 1] = (byte) ((a[iRev] >>> 16) & 0xFF);
+            b[i * 4 + 2] = (byte) ((a[iRev] >>> 8) & 0xFF);
+            b[i * 4 + 3] = (byte) (a[iRev] & 0xFF);
+        }
+        return new BigInteger(1, b);
+    }
+
+    /**
+     * Converts a {@link BigInteger} to an <code>int</code> array.
+     *
+     * @return an <code>int</code> array that is compatible with the <code>mult()</code> methods
+     */
+    private static int[] toIntArray(BigInteger a) {
+        byte[] aArr = a.toByteArray();
+        int[] b = new int[(aArr.length + 3) / 4];
+        for (int i = 0; i < aArr.length; i++)
+            b[i / 4] += (aArr[aArr.length - 1 - i] & 0xFF) << ((i % 4) * 8);
+        return b;
+    }
+
+    private static int[] toIntArray(UnivariatePolynomial<BigInteger> a, int k) {
+        int len = a.degree + 1;
+        int sign = a.lc().signum();
+
+        int[] aInt = new int[len * k];
+        for (int i = len - 1; i >= 0; i--) {
+            int[] cArr = toIntArray(a.data[i].abs());
+            if (a.data[i].signum() * sign < 0)
+                subShifted(aInt, cArr, i * k);
+            else
+                addShifted(aInt, cArr, i * k);
+        }
+
+        return aInt;
+    }
+
+    /** drops elements of b that are shifted outside the valid range */
+    private static void addShifted(int[] a, int[] b, int numElements) {
+        boolean carry = false;
+        int i = 0;
+        while (i < Math.min(b.length, a.length - numElements)) {
+            int ai = a[i + numElements];
+            int sum = ai + b[i];
+            if (carry)
+                sum++;
+            carry = ((sum >>> 31) < (ai >>> 31) + (b[i] >>> 31));   // carry if signBit(sum) < signBit(a)+signBit(b)
+            a[i + numElements] = sum;
+            i++;
+        }
+        i += numElements;
+        while (carry) {
+            a[i]++;
+            carry = a[i] == 0;
+            i++;
+        }
+    }
+
+    /** drops elements of b that are shifted outside the valid range */
+    private static void subShifted(int[] a, int[] b, int numElements) {
+        boolean carry = false;
+        int i = 0;
+        while (i < Math.min(b.length, a.length - numElements)) {
+            int ai = a[i + numElements];
+            int diff = ai - b[i];
+            if (carry)
+                diff--;
+            carry = ((diff >>> 31) > (a[i] >>> 31) - (b[i] >>> 31));   // carry if signBit(diff) > signBit(a)-signBit(b)
+            a[i + numElements] = diff;
+            i++;
+        }
+        i += numElements;
+        while (carry) {
+            a[i]--;
+            carry = a[i] == -1;
+            i++;
+        }
     }
 }
